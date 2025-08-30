@@ -19,22 +19,34 @@ if sys.version_info[:2] != (3, 9):
     sys.exit(1)
 import wave
 import threading
-import queue
 import tempfile
-from pathlib import Path
+import select
+import termios
+import tty
+import signal
+import atexit
 from typing import Optional, Tuple, List
 from dataclasses import dataclass
-from contextlib import contextmanager
+from enum import Enum
 
 import pyaudio
 import numpy as np
 import httpx
 from dotenv import load_dotenv
+from rich.console import Console
+from rich.markdown import Markdown
+from rich.panel import Panel
+from rich.text import Text
+from rich.progress import Progress, SpinnerColumn, TextColumn
 
 # Load environment variables
 load_dotenv()
 
 # Configuration
+class RecordingMode(Enum):
+    VAD = "vad"  # Voice Activity Detection
+    SPACE_TOGGLE = "space_toggle"  # Space Bar Toggle Recording
+
 @dataclass
 class AudioConfig:
     CHUNK_SIZE: int = 1024
@@ -45,6 +57,7 @@ class AudioConfig:
     SILENCE_DURATION: float = 2.5
     MIN_AUDIO_LENGTH: float = 1.0
     BYTES_PER_SAMPLE: int = 2
+    PTT_KEY: str = ' '  # Space bar for push-to-talk
 
 
 @dataclass
@@ -182,17 +195,17 @@ class WhisperProcessor:
     def load_model(self):
         """Load Whisper model"""
         try:
-            import whisper
-            print("📥 Loading Whisper model...")
-            self.model = whisper.load_model("base")
+            from faster_whisper import WhisperModel
+            print("📥 Loading faster-whisper model...")
+            self.model = WhisperModel("base", device="cpu", compute_type="int8")
             self.model_loaded = True
-            print("✅ Whisper model loaded successfully")
+            print("✅ faster-whisper model loaded successfully")
             return True
         except ImportError:
-            print("❌ Whisper not installed. Install with: uv pip install openai-whisper")
+            print("❌ faster-whisper not installed. Install with: uv pip install faster-whisper")
             return False
         except Exception as e:
-            print(f"❌ Failed to load Whisper model: {e}")
+            print(f"❌ Failed to load faster-whisper model: {e}")
             return False
     
     def transcribe(self, audio_buffer: List[bytes], config: AudioConfig) -> Optional[str]:
@@ -222,12 +235,29 @@ class WhisperProcessor:
                 wav_file.writeframes(b''.join(audio_buffer))
             
             # Transcribe
-            print("🔄 Transcribing speech...")
-            result = self.model.transcribe(temp_path, language="en")
-            text = result["text"].strip()
+            console = Console()
+            with Progress(
+                SpinnerColumn(),
+                TextColumn("🔄 Transcribing speech..."),
+                console=console
+            ) as progress:
+                task = progress.add_task("Transcribing...", total=1)
+                segments, info = self.model.transcribe(temp_path, language="en")
+                progress.update(task, completed=1)
+            
+            # Extract text from segments
+            text = "".join([segment.text for segment in segments]).strip()
             
             if text:
-                print(f"📝 Transcribed: {text}")
+                # Use Rich to display transcribed text nicely
+                console.print(
+                    Panel(
+                        Text(text, style="green"),
+                        title="📝 Transcribed",
+                        title_align="left",
+                        border_style="green"
+                    )
+                )
                 return text
             else:
                 print("⚠️ No speech detected in audio")
@@ -273,12 +303,20 @@ class TogetherClient:
         }
         
         try:
-            print("🤖 Sending to LLM...")
-            response = self.client.post(
-                self.config.TOGETHER_API_URL,
-                json=payload,
-                headers=headers
-            )
+            # Use Rich to show a nice loading indicator
+            console = Console()
+            with Progress(
+                SpinnerColumn(),
+                TextColumn("🤖 Sending to LLM..."),
+                console=console
+            ) as progress:
+                task = progress.add_task("Sending...", total=1)
+                response = self.client.post(
+                    self.config.TOGETHER_API_URL,
+                    json=payload,
+                    headers=headers
+                )
+                progress.update(task, completed=1)
             response.raise_for_status()
             
             data = response.json()
@@ -304,6 +342,31 @@ class TogetherClient:
         self.client.close()
 
 
+class KeyboardListener:
+    """Non-blocking keyboard input handler for push-to-talk"""
+    
+    def __init__(self):
+        self.old_settings = None
+        self.is_pressed = False
+        
+    def setup(self):
+        """Set terminal to cbreak mode for immediate key detection"""
+        self.old_settings = termios.tcgetattr(sys.stdin)
+        tty.setcbreak(sys.stdin.fileno())
+        
+    def restore(self):
+        """Restore terminal settings"""
+        if self.old_settings:
+            termios.tcsetattr(sys.stdin, termios.TCSADRAIN, self.old_settings)
+    
+    def check_key_event(self) -> Optional[str]:
+        """Check for key events (non-blocking)"""
+        if select.select([sys.stdin], [], [], 0) == ([sys.stdin], [], []):
+            key = sys.stdin.read(1)
+            return key
+        return None
+
+
 class VoiceLLMApp:
     """Main application coordinating all components"""
     
@@ -314,12 +377,26 @@ class VoiceLLMApp:
         self.silence_detector = SilenceDetector(self.audio_config)
         self.whisper_processor = WhisperProcessor()
         self.together_client = TogetherClient(self.api_config)
+        self.keyboard_listener = KeyboardListener()
         self.running = False
+        self.recording_mode = RecordingMode.VAD
+        self.cleanup_registered = False
+        
+        # Initialize Rich console
+        self.console = Console()
+        
+        # Register signal handlers
+        self.register_signal_handlers()
         
     def initialize(self) -> bool:
         """Initialize all components"""
-        print("\n🚀 Initializing Voice-to-LLM Application...")
-        print("=" * 50)
+        self.console.print("\n")
+        self.console.print(
+            Panel(
+                Text("🚀 Initializing Voice-to-LLM Application", style="bold cyan"),
+                border_style="cyan"
+            )
+        )
         
         # Check API key
         if not self.api_config.TOGETHER_API_KEY:
@@ -335,16 +412,77 @@ class VoiceLLMApp:
         if not self.whisper_processor.load_model():
             return False
         
-        print("=" * 50)
-        print("✅ All components initialized successfully!")
-        print("\n📢 Instructions:")
-        print("  • Speak into your microphone")
-        print("  • Pause for 2-3 seconds when done")
-        print("  • Wait for the LLM response")
-        print("  • Press Ctrl+C to exit\n")
-        print("=" * 50)
+        # Select recording mode
+        self.select_recording_mode()
+        
+        self.console.print(
+            Panel(
+                Text("✅ All components initialized successfully!", style="bold green"),
+                border_style="green"
+            )
+        )
+        self.console.print("\n📢 Instructions:", style="bold yellow")
+        
+        if self.recording_mode == RecordingMode.VAD:
+            instructions = [
+                "• Mode: Voice Activity Detection (VAD)",
+                "• Speak into your microphone",
+                "• Pause for 2-3 seconds when done",
+                "• Wait for the LLM response",
+                "• Press Ctrl+C to exit"
+            ]
+        else:
+            instructions = [
+                "• Mode: Space Bar Toggle Recording",
+                "• Press SPACE to START recording",
+                "• Press SPACE again to STOP and send to LLM",
+                "• Wait for the LLM response",
+                "• Press 'Q' or Ctrl+C to exit"
+            ]
+        
+        self.console.print(
+            Panel(
+                "\n".join(instructions),
+                title="Instructions",
+                border_style="yellow",
+                padding=(1, 2)
+            )
+        )
         
         return True
+    
+    def select_recording_mode(self):
+        """Allow user to select recording mode"""
+        self.console.print("\n")
+        self.console.print(
+            Panel(
+                "1. Voice Activity Detection (VAD) - Automatic silence detection\n"
+                "2. Space Bar Toggle Recording - Press SPACE to start/stop recording",
+                title="🎙️ Select Recording Mode",
+                border_style="magenta",
+                padding=(1, 2)
+            )
+        )
+        
+        while True:
+            try:
+                choice = input("\nEnter choice (1 or 2): ").strip()
+                if choice == "1":
+                    self.recording_mode = RecordingMode.VAD
+                    break
+                elif choice == "2":
+                    self.recording_mode = RecordingMode.SPACE_TOGGLE
+                    break
+                else:
+                    print("Invalid choice. Please enter 1 or 2.")
+            except KeyboardInterrupt:
+                print("\n\n⚠️  Setup cancelled by user.")
+                self.shutdown()
+                sys.exit(0)
+            except EOFError:
+                print("\n\n⚠️  Input stream closed.")
+                self.shutdown()
+                sys.exit(1)
     
     def process_audio_buffer(self, audio_buffer: List[bytes]):
         """Process captured audio: transcribe and send to LLM"""
@@ -352,20 +490,30 @@ class VoiceLLMApp:
         text = self.whisper_processor.transcribe(audio_buffer, self.audio_config)
         
         if not text:
-            print("⚠️ No text to process")
+            self.console.print("⚠️ No text to process", style="yellow")
             return
         
         # Send to LLM
         response = self.together_client.send_message(text)
         
         if response:
-            print("\n" + "=" * 50)
-            print("🤖 LLM Response:")
-            print("-" * 50)
-            print(response)
-            print("=" * 50 + "\n")
+            # Create markdown object for the response
+            markdown_response = Markdown(response)
+            
+            # Display in a panel with proper styling
+            self.console.print("\n")
+            self.console.print(
+                Panel(
+                    markdown_response,
+                    title="🤖 LLM Response",
+                    title_align="left",
+                    border_style="blue",
+                    padding=(1, 2)
+                )
+            )
+            self.console.print("\n")
         else:
-            print("⚠️ No response from LLM")
+            self.console.print("⚠️ No response from LLM", style="yellow")
     
     def run(self):
         """Main application loop"""
@@ -373,7 +521,15 @@ class VoiceLLMApp:
             return
         
         self.running = True
-        print("🎧 Listening... (speak now)")
+        
+        if self.recording_mode == RecordingMode.VAD:
+            self.run_vad_mode()
+        else:
+            self.run_space_toggle_mode()
+    
+    def run_vad_mode(self):
+        """Run with Voice Activity Detection mode"""
+        self.console.print("🎧 Listening... (speak now)", style="bold green")
         
         try:
             while self.running:
@@ -390,7 +546,7 @@ class VoiceLLMApp:
                 is_silent, trigger_processing = self.silence_detector.process_chunk(chunk)
                 
                 if trigger_processing:
-                    print("🔕 Silence detected, processing...")
+                    self.console.print("🔕 Silence detected, processing...", style="yellow")
                     
                     # Get audio buffer and process
                     audio_buffer = self.audio_capture.get_buffer_copy()
@@ -398,25 +554,173 @@ class VoiceLLMApp:
                     
                     # Clear buffer for next recording
                     self.audio_capture.clear_buffer()
-                    print("🎧 Listening... (speak now)")
+                    self.console.print("🎧 Listening... (speak now)", style="bold green")
                     
         except KeyboardInterrupt:
-            print("\n\n👋 Shutting down...")
+            pass  # Signal handler will take care of shutdown
+        except Exception as e:
+            print(f"\n❌ Error in VAD mode: {e}")
+            self.shutdown()
+    
+    def run_space_toggle_mode(self):
+        """Run with space bar toggle recording mode"""
+        self.console.print(f"\n🎧 Ready! Press SPACE to start/stop recording...\n", style="bold green")
+        
+        # Setup keyboard listener
+        try:
+            self.keyboard_listener.setup()
+        except Exception as e:
+            print(f"❌ Failed to setup keyboard listener: {e}")
+            return
+        
+        try:
+            is_recording = False
+            ptt_buffer = []
+            
+            while self.running:
+                # Check for key events
+                key = self.keyboard_listener.check_key_event()
+                
+                if key == 'q' or key == 'Q':  # Allow 'q' to quit
+                    print("\n\n📤 Quit command received...")
+                    break
+                elif key == '\x03':  # Ctrl+C to quit
+                    raise KeyboardInterrupt
+                elif key == ' ':  # Space bar to toggle recording
+                    # Toggle recording state
+                    if not is_recording:
+                        # Start recording
+                        is_recording = True
+                        ptt_buffer = []
+                        self.console.print("\n🔴 Recording... (press SPACE again to stop)", style="bold red")
+                    else:
+                        # Stop recording and process
+                        is_recording = False
+                        self.console.print("⏹️  Recording stopped, processing...\n", style="yellow")
+                        
+                        if ptt_buffer:
+                            self.process_audio_buffer(ptt_buffer)
+                        
+                        ptt_buffer = []
+                        self.console.print(f"\n🎧 Ready! Press SPACE to start recording... (Press 'Q' to quit)\n", style="bold green")
+                
+                # Read audio chunk if available
+                chunk = self.audio_capture.read_chunk()
+                if chunk and is_recording:
+                    ptt_buffer.append(chunk)
+                
+                time.sleep(0.01)
+                    
+        except KeyboardInterrupt:
+            pass  # Signal handler will take care of shutdown
+        except Exception as e:
+            print(f"\n❌ Error in PTT mode: {e}")
         finally:
-            self.cleanup()
+            # Ensure terminal is restored even if error occurs
+            try:
+                self.keyboard_listener.restore()
+            except:
+                pass
+    
+    def register_signal_handlers(self):
+        """Register signal handlers for graceful shutdown"""
+        def signal_handler(signum, frame):
+            if hasattr(self, 'console'):
+                self.console.print("\n\n⚠️  Interrupt received, shutting down gracefully...", style="yellow")
+            else:
+                print("\n\n⚠️  Interrupt received, shutting down gracefully...")
+            self.shutdown()
+            sys.exit(0)
+        
+        # Register handlers for common termination signals
+        signal.signal(signal.SIGINT, signal_handler)  # Ctrl+C
+        signal.signal(signal.SIGTERM, signal_handler)  # Termination signal
+        
+        # Register cleanup at exit
+        atexit.register(self.cleanup)
+    
+    def shutdown(self):
+        """Initiate graceful shutdown"""
+        if hasattr(self, 'console'):
+            self.console.print("🛑 Stopping recording...", style="yellow")
+        else:
+            print("🛑 Stopping recording...")
+        self.running = False
+        
+        # Give threads time to finish
+        time.sleep(0.5)
+        
+        # Perform cleanup
+        self.cleanup()
     
     def cleanup(self):
         """Cleanup resources"""
+        if self.cleanup_registered:
+            return  # Avoid double cleanup
+        
+        self.cleanup_registered = True
         self.running = False
-        self.audio_capture.stop()
-        self.together_client.close()
-        print("✅ Cleanup complete. Goodbye!")
+        
+        try:
+            # Restore terminal settings first if in space toggle mode
+            if self.recording_mode == RecordingMode.SPACE_TOGGLE and self.keyboard_listener.old_settings:
+                self.keyboard_listener.restore()
+                if hasattr(self, 'console'):
+                    self.console.print("✅ Terminal settings restored", style="green")
+                else:
+                    print("✅ Terminal settings restored")
+            
+            # Stop audio capture
+            if hasattr(self, 'audio_capture') and self.audio_capture.stream:
+                self.audio_capture.stop()
+                if hasattr(self, 'console'):
+                    self.console.print("✅ Audio capture stopped", style="green")
+                else:
+                    print("✅ Audio capture stopped")
+            
+            # Close API client
+            if hasattr(self, 'together_client'):
+                self.together_client.close()
+                if hasattr(self, 'console'):
+                    self.console.print("✅ API client closed", style="green")
+                else:
+                    print("✅ API client closed")
+                
+        except Exception as e:
+            if hasattr(self, 'console'):
+                self.console.print(f"⚠️  Error during cleanup: {e}", style="red")
+            else:
+                print(f"⚠️  Error during cleanup: {e}")
+        
+        if hasattr(self, 'console'):
+            self.console.print(
+                Panel(
+                    Text("✅ Cleanup complete. Goodbye!", style="bold green"),
+                    border_style="green"
+                )
+            )
+        else:
+            print("✅ Cleanup complete. Goodbye!")
 
 
 def main():
     """Entry point"""
-    app = VoiceLLMApp()
-    app.run()
+    app = None
+    try:
+        app = VoiceLLMApp()
+        app.run()
+    except Exception as e:
+        print(f"\n❌ Fatal error: {e}")
+        if app:
+            app.shutdown()
+        sys.exit(1)
+    except SystemExit:
+        # Let system exit normally
+        raise
+    finally:
+        # Ensure cleanup happens
+        if app and not app.cleanup_registered:
+            app.cleanup()
 
 
 if __name__ == "__main__":

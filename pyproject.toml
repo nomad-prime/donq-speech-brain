@@ -4,10 +4,12 @@ version = "0.1.0"
 description = "Voice-to-LLM application with speech recognition and AI response generation"
 requires-python = "==3.9.*"
 dependencies = [
+    "faster-whisper>=1.2.0",
     "httpx>=0.28.1",
     "numpy>=1.21.0,<2.0.0",
     "pyaudio>=0.2.14",
     "pydantic>=2.11.7",
     "python-dotenv>=1.1.1",
     "requests>=2.32.5",
+    "rich>=14.1.0",
 ]
