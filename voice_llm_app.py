@@ -5,6 +5,7 @@ Captures speech, detects silence, transcribes with Whisper, and sends to Togethe
 """
 
 import os
+from pathlib import Path
 import sys
 import time
 
@@ -280,6 +281,8 @@ class TogetherClient:
     def __init__(self, config: APIConfig):
         self.config = config
         self.client = httpx.Client(timeout=30.0)
+        self.conversation_history = []
+        self.system_prompt = None
         
     def send_message(self, text: str) -> Optional[str]:
         """Send text to Together.ai LLM and get response"""
@@ -292,11 +295,20 @@ class TogetherClient:
             "Content-Type": "application/json"
         }
         
+        # Build messages with system prompt and conversation history
+        messages = []
+        if self.system_prompt:
+            messages.append({"role": "system", "content": self.system_prompt})
+        
+        # Add conversation history
+        messages.extend(self.conversation_history)
+        
+        # Add current user message
+        messages.append({"role": "user", "content": text})
+        
         payload = {
             "model": self.config.DEFAULT_MODEL,
-            "messages": [
-                {"role": "user", "content": text}
-            ],
+            "messages": messages,
             "max_tokens": self.config.MAX_TOKENS,
             "temperature": self.config.TEMPERATURE,
             "stream": False
@@ -322,6 +334,11 @@ class TogetherClient:
             data = response.json()
             if "choices" in data and len(data["choices"]) > 0:
                 llm_response = data["choices"][0]["message"]["content"]
+                
+                # Add to conversation history
+                self.conversation_history.append({"role": "user", "content": text})
+                self.conversation_history.append({"role": "assistant", "content": llm_response})
+                
                 return llm_response
             else:
                 print("⚠️ Unexpected response format from LLM")
@@ -336,6 +353,31 @@ class TogetherClient:
         except Exception as e:
             print(f"❌ LLM API error: {e}")
             return None
+    
+    def reset_conversation(self):
+        """Reset conversation history"""
+        self.conversation_history = []
+        
+    def set_system_prompt(self, prompt: str):
+        """Set system prompt"""
+        self.system_prompt = prompt
+        
+    def load_system_prompt_from_file(self, file_path: str) -> bool:
+        """Load system prompt from file"""
+        try:
+            with open(file_path, 'r', encoding='utf-8') as f:
+                self.system_prompt = f.read().strip()
+            return True
+        except FileNotFoundError:
+            print(f"⚠️ System prompt file not found: {file_path}")
+            return False
+        except Exception as e:
+            print(f"⚠️ Error loading system prompt: {e}")
+            return False
+    
+    def get_conversation_count(self) -> int:
+        """Get number of messages in conversation history"""
+        return len(self.conversation_history) // 2  # Divide by 2 since each exchange has user + assistant
     
     def close(self):
         """Close HTTP client"""
@@ -412,13 +454,30 @@ class VoiceLLMApp:
         if not self.whisper_processor.load_model():
             return False
         
+        # Try to load system prompt from file
+        self.load_system_prompt()
+        
         # Select recording mode
         self.select_recording_mode()
         
+        # Display feature info
+        feature_info = []
+        feature_info.append("✅ All components initialized successfully!")
+        feature_info.append("")
+        feature_info.append("🆕 New Features:")
+        feature_info.append("  • Conversation history retained across messages")
+        if self.together_client.system_prompt:
+            feature_info.append("  • Custom system prompt loaded")
+        else:
+            feature_info.append("  • No system prompt (place in system_prompt.txt to use)")
+        feature_info.append("  • Press 'R' to reset conversation history")
+        
         self.console.print(
             Panel(
-                Text("✅ All components initialized successfully!", style="bold green"),
-                border_style="green"
+                "\n".join(feature_info),
+                title="🚀 Ready to Go!",
+                border_style="green",
+                padding=(1, 2)
             )
         )
         self.console.print("\n📢 Instructions:", style="bold yellow")
@@ -429,6 +488,7 @@ class VoiceLLMApp:
                 "• Speak into your microphone",
                 "• Pause for 2-3 seconds when done",
                 "• Wait for the LLM response",
+                "• Press 'R' to RESET conversation history",
                 "• Press Ctrl+C to exit"
             ]
         else:
@@ -436,6 +496,7 @@ class VoiceLLMApp:
                 "• Mode: Space Bar Toggle Recording",
                 "• Press SPACE to START recording",
                 "• Press SPACE again to STOP and send to LLM",
+                "• Press 'R' to RESET conversation history",
                 "• Wait for the LLM response",
                 "• Press 'Q' or Ctrl+C to exit"
             ]
@@ -450,6 +511,39 @@ class VoiceLLMApp:
         )
         
         return True
+    
+    def load_system_prompt(self):
+        """Try to load system prompt from various file locations with priority order"""
+        # Priority order: local files first (not committed), then defaults (committed)
+        possible_files = [
+            # Local files (should be in .gitignore)
+            ".system_prompt.txt",           # Hidden local file (highest priority)
+            "system_prompt.local.txt",      # Local override
+            "system_prompt.txt",            # Standard local file
+            
+            # Default/shared files (committed to repo)
+            "system_prompt.default.txt",    # Default for the repo
+            "system.txt",                   # Alternative name
+            "prompt.txt",                   # Alternative name
+        ]
+        
+        for file_path in possible_files:
+            if Path(file_path).exists():
+                if self.together_client.load_system_prompt_from_file(file_path):
+                    # Determine if this is a local or default file
+                    is_local = any(local_name in file_path for local_name in [".system_prompt", "local", "system_prompt.txt"])
+                    file_type = "🔒 local" if is_local and not file_path.endswith('.default.txt') else "📋 default"
+                    
+                    self.console.print(f"✅ System prompt loaded from: {file_path} ({file_type})", style="green")
+                    # Show first 100 characters of the prompt
+                    preview = self.together_client.system_prompt[:100]
+                    if len(self.together_client.system_prompt) > 100:
+                        preview += "..."
+                    self.console.print(f"📄 Preview: {preview}", style="dim")
+                    return
+                    
+        self.console.print("ℹ️ No system prompt file found", style="dim")
+        self.console.print("💡 Create .system_prompt.txt (local) or use system_prompt.default.txt", style="dim")
     
     def select_recording_mode(self):
         """Allow user to select recording mode"""
@@ -500,12 +594,16 @@ class VoiceLLMApp:
             # Create markdown object for the response
             markdown_response = Markdown(response)
             
+            # Get conversation count for display
+            conv_count = self.together_client.get_conversation_count()
+            title = f"🤖 LLM Response (Message {conv_count})"
+            
             # Display in a panel with proper styling
             self.console.print("\n")
             self.console.print(
                 Panel(
                     markdown_response,
-                    title="🤖 LLM Response",
+                    title=title,
                     title_align="left",
                     border_style="blue",
                     padding=(1, 2)
@@ -531,8 +629,24 @@ class VoiceLLMApp:
         """Run with Voice Activity Detection mode"""
         self.console.print("🎧 Listening... (speak now)", style="bold green")
         
+        # Setup keyboard listener for 'R' reset functionality
+        try:
+            self.keyboard_listener.setup()
+        except Exception as e:
+            print(f"❌ Failed to setup keyboard listener: {e}")
+            return
+        
         try:
             while self.running:
+                # Check for key events
+                key = self.keyboard_listener.check_key_event()
+                if key == 'r' or key == 'R':
+                    # Reset conversation history
+                    self.together_client.reset_conversation()
+                    count = self.together_client.get_conversation_count()
+                    self.console.print(f"\n🔄 Conversation history reset! (was {count} messages)\n", style="cyan")
+                    self.console.print("🎧 Listening... (speak now)", style="bold green")
+                
                 # Read audio chunk
                 chunk = self.audio_capture.read_chunk()
                 if chunk is None:
@@ -561,6 +675,12 @@ class VoiceLLMApp:
         except Exception as e:
             print(f"\n❌ Error in VAD mode: {e}")
             self.shutdown()
+        finally:
+            # Ensure terminal is restored
+            try:
+                self.keyboard_listener.restore()
+            except:
+                pass
     
     def run_space_toggle_mode(self):
         """Run with space bar toggle recording mode"""
@@ -586,6 +706,12 @@ class VoiceLLMApp:
                     break
                 elif key == '\x03':  # Ctrl+C to quit
                     raise KeyboardInterrupt
+                elif key == 'r' or key == 'R':  # Reset conversation history
+                    if not is_recording:  # Only allow reset when not recording
+                        count = self.together_client.get_conversation_count()
+                        self.together_client.reset_conversation()
+                        self.console.print(f"\n🔄 Conversation history reset! (was {count} messages)\n", style="cyan")
+                        self.console.print(f"🎧 Ready! Press SPACE to start recording... (Press 'Q' to quit)\n", style="bold green")
                 elif key == ' ':  # Space bar to toggle recording
                     # Toggle recording state
                     if not is_recording:
@@ -662,8 +788,8 @@ class VoiceLLMApp:
         self.running = False
         
         try:
-            # Restore terminal settings first if in space toggle mode
-            if self.recording_mode == RecordingMode.SPACE_TOGGLE and self.keyboard_listener.old_settings:
+            # Restore terminal settings first if using keyboard input
+            if (self.recording_mode == RecordingMode.SPACE_TOGGLE or self.recording_mode == RecordingMode.VAD) and self.keyboard_listener.old_settings:
                 self.keyboard_listener.restore()
                 if hasattr(self, 'console'):
                     self.console.print("✅ Terminal settings restored", style="green")

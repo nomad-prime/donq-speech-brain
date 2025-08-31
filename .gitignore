@@ -9,3 +9,8 @@ wheels/
 # Virtual environments
 .venv
 .env
+
+# Local system prompts (not committed to repo)
+.system_prompt.txt
+system_prompt.local.txt
+system_prompt.txt
