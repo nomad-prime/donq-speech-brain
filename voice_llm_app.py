@@ -284,8 +284,8 @@ class TogetherClient:
         self.conversation_history = []
         self.system_prompt = None
         
-    def send_message(self, text: str) -> Optional[str]:
-        """Send text to Together.ai LLM and get response"""
+    def send_message(self, text: str, stream: bool = False) -> Optional[str]:
+        """Send text to Together.ai LLM and get response (with optional streaming)"""
         if not self.config.TOGETHER_API_KEY:
             print("❌ TOGETHER_API_KEY not set in environment variables")
             return None
@@ -311,39 +311,44 @@ class TogetherClient:
             "messages": messages,
             "max_tokens": self.config.MAX_TOKENS,
             "temperature": self.config.TEMPERATURE,
-            "stream": False
+            "stream": stream
         }
         
         try:
-            # Use Rich to show a nice loading indicator
             console = Console()
-            with Progress(
-                SpinnerColumn(),
-                TextColumn("🤖 Sending to LLM..."),
-                console=console
-            ) as progress:
-                task = progress.add_task("Sending...", total=1)
-                response = self.client.post(
-                    self.config.TOGETHER_API_URL,
-                    json=payload,
-                    headers=headers
-                )
-                progress.update(task, completed=1)
-            response.raise_for_status()
             
-            data = response.json()
-            if "choices" in data and len(data["choices"]) > 0:
-                llm_response = data["choices"][0]["message"]["content"]
-                
-                # Add to conversation history
-                self.conversation_history.append({"role": "user", "content": text})
-                self.conversation_history.append({"role": "assistant", "content": llm_response})
-                
-                return llm_response
+            if stream:
+                # Streaming mode
+                return self._handle_streaming_response(headers, payload, text, console)
             else:
-                print("⚠️ Unexpected response format from LLM")
-                return None
+                # Standard mode
+                with Progress(
+                    SpinnerColumn(),
+                    TextColumn("🤖 Sending to LLM..."),
+                    console=console
+                ) as progress:
+                    task = progress.add_task("Sending...", total=1)
+                    response = self.client.post(
+                        self.config.TOGETHER_API_URL,
+                        json=payload,
+                        headers=headers
+                    )
+                    progress.update(task, completed=1)
+                response.raise_for_status()
                 
+                data = response.json()
+                if "choices" in data and len(data["choices"]) > 0:
+                    llm_response = data["choices"][0]["message"]["content"]
+                    
+                    # Add to conversation history
+                    self.conversation_history.append({"role": "user", "content": text})
+                    self.conversation_history.append({"role": "assistant", "content": llm_response})
+                    
+                    return llm_response
+                else:
+                    print("⚠️ Unexpected response format from LLM")
+                    return None
+                    
         except httpx.HTTPStatusError as e:
             if e.response.status_code == 401:
                 print("❌ Invalid API key. Please check your TOGETHER_API_KEY")
@@ -352,6 +357,74 @@ class TogetherClient:
             return None
         except Exception as e:
             print(f"❌ LLM API error: {e}")
+            return None
+    
+    def _handle_streaming_response(self, headers: dict, payload: dict, user_text: str, console: Console) -> Optional[str]:
+        """Handle streaming response from the LLM"""
+        import json
+        
+        try:
+            # Get conversation count for display
+            conv_count = self.get_conversation_count() + 1
+            
+            # Print header for streaming response
+            console.print(f"\n🤖 LLM Response (Message {conv_count}) - Streaming:", style="bold blue")
+            console.print("─" * 60, style="blue")
+            
+            # Make streaming request
+            with self.client.stream("POST", self.config.TOGETHER_API_URL, json=payload, headers=headers) as response:
+                response.raise_for_status()
+                
+                full_response = ""
+                current_line = ""
+                
+                for line in response.iter_lines():
+                    if line.startswith("data: "):
+                        data_str = line[6:]  # Remove "data: " prefix
+                        
+                        if data_str == "[DONE]":
+                            if current_line:
+                                console.print()  # New line after streaming
+                            break
+                        
+                        try:
+                            data = json.loads(data_str)
+                            if "choices" in data and len(data["choices"]) > 0:
+                                delta = data["choices"][0].get("delta", {})
+                                content = delta.get("content", "")
+                                
+                                if content:
+                                    full_response += content
+                                    current_line += content
+                                    
+                                    # Print tokens as they arrive
+                                    console.print(content, end="", style="green")
+                                    
+                                    # Check for newlines to flush the line
+                                    if "\n" in content:
+                                        current_line = ""
+                        except json.JSONDecodeError:
+                            continue
+                
+                console.print("\n" + "─" * 60 + "\n", style="blue")
+                
+                # Add to conversation history
+                if full_response:
+                    self.conversation_history.append({"role": "user", "content": user_text})
+                    self.conversation_history.append({"role": "assistant", "content": full_response})
+                    return full_response
+                else:
+                    console.print("⚠️ No response received from LLM", style="yellow")
+                    return None
+                    
+        except httpx.HTTPStatusError as e:
+            if e.response.status_code == 401:
+                console.print("❌ Invalid API key. Please check your TOGETHER_API_KEY", style="red")
+            else:
+                console.print(f"❌ HTTP error: {e.response.status_code} - {e.response.text}", style="red")
+            return None
+        except Exception as e:
+            console.print(f"❌ Streaming error: {e}", style="red")
             return None
     
     def reset_conversation(self):
@@ -422,6 +495,7 @@ class VoiceLLMApp:
         self.keyboard_listener = KeyboardListener()
         self.running = False
         self.recording_mode = RecordingMode.VAD
+        self.stream_response = False  # New flag for streaming responses
         self.cleanup_registered = False
         
         # Initialize Rich console
@@ -460,6 +534,9 @@ class VoiceLLMApp:
         # Select recording mode
         self.select_recording_mode()
         
+        # Ask about streaming preference
+        self.select_streaming_mode()
+        
         # Display feature info
         feature_info = []
         feature_info.append("✅ All components initialized successfully!")
@@ -471,6 +548,8 @@ class VoiceLLMApp:
         else:
             feature_info.append("  • No system prompt (place in system_prompt.txt to use)")
         feature_info.append("  • Press 'R' to reset conversation history")
+        streaming_mode = "streaming" if self.stream_response else "standard"
+        feature_info.append(f"  • Response mode: {streaming_mode}")
         
         self.console.print(
             Panel(
@@ -578,6 +657,39 @@ class VoiceLLMApp:
                 self.shutdown()
                 sys.exit(1)
     
+    def select_streaming_mode(self):
+        """Allow user to select whether to stream LLM responses"""
+        self.console.print("\n")
+        self.console.print(
+            Panel(
+                "1. Standard mode - Display complete response after processing\n"
+                "2. Streaming mode - Stream response tokens as they arrive",
+                title="📡 Select Response Mode",
+                border_style="cyan",
+                padding=(1, 2)
+            )
+        )
+        
+        while True:
+            try:
+                choice = input("\nEnter choice (1 or 2): ").strip()
+                if choice == "1":
+                    self.stream_response = False
+                    break
+                elif choice == "2":
+                    self.stream_response = True
+                    break
+                else:
+                    print("Invalid choice. Please enter 1 or 2.")
+            except KeyboardInterrupt:
+                print("\n\n⚠️  Setup cancelled by user.")
+                self.shutdown()
+                sys.exit(0)
+            except EOFError:
+                print("\n\n⚠️  Input stream closed.")
+                self.shutdown()
+                sys.exit(1)
+    
     def process_audio_buffer(self, audio_buffer: List[bytes]):
         """Process captured audio: transcribe and send to LLM"""
         # Transcribe audio
@@ -587,29 +699,32 @@ class VoiceLLMApp:
             self.console.print("⚠️ No text to process", style="yellow")
             return
         
-        # Send to LLM
-        response = self.together_client.send_message(text)
+        # Send to LLM with streaming option
+        response = self.together_client.send_message(text, stream=self.stream_response)
         
         if response:
-            # Create markdown object for the response
-            markdown_response = Markdown(response)
-            
-            # Get conversation count for display
-            conv_count = self.together_client.get_conversation_count()
-            title = f"🤖 LLM Response (Message {conv_count})"
-            
-            # Display in a panel with proper styling
-            self.console.print("\n")
-            self.console.print(
-                Panel(
-                    markdown_response,
-                    title=title,
-                    title_align="left",
-                    border_style="blue",
-                    padding=(1, 2)
+            if not self.stream_response:
+                # Standard mode: Display complete response in a panel
+                # Create markdown object for the response
+                markdown_response = Markdown(response)
+                
+                # Get conversation count for display
+                conv_count = self.together_client.get_conversation_count()
+                title = f"🤖 LLM Response (Message {conv_count})"
+                
+                # Display in a panel with proper styling
+                self.console.print("\n")
+                self.console.print(
+                    Panel(
+                        markdown_response,
+                        title=title,
+                        title_align="left",
+                        border_style="blue",
+                        padding=(1, 2)
+                    )
                 )
-            )
-            self.console.print("\n")
+                self.console.print("\n")
+            # In streaming mode, the response is already displayed by the streaming handler
         else:
             self.console.print("⚠️ No response from LLM", style="yellow")
     
