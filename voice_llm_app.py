@@ -362,6 +362,8 @@ class TogetherClient:
     def _handle_streaming_response(self, headers: dict, payload: dict, user_text: str, console: Console) -> Optional[str]:
         """Handle streaming response from the LLM"""
         import json
+        from rich.live import Live
+        from rich.markdown import Markdown
         
         try:
             # Get conversation count for display
@@ -376,39 +378,28 @@ class TogetherClient:
                 response.raise_for_status()
                 
                 full_response = ""
-                buffer = ""
                 
-                for line in response.iter_lines():
-                    if line.startswith("data: "):
-                        data_str = line[6:]  # Remove "data: " prefix
-                        
-                        if data_str == "[DONE]":
-                            # Print any remaining content in the buffer
-                            if buffer:
-                                console.print(buffer, style="green")
-                            break
-                        
-                        try:
-                            data = json.loads(data_str)
-                            if "choices" in data and len(data["choices"]) > 0:
-                                delta = data["choices"][0].get("delta", {})
-                                content = delta.get("content", "")
-                                
-                                if content:
-                                    full_response += content
-                                    buffer += content
+                # Use Live display to update the markdown as we receive content
+                with Live(console=console, refresh_per_second=4) as live:
+                    for line in response.iter_lines():
+                        if line.startswith("data: "):
+                            data_str = line[6:]  # Remove "data: " prefix
+                            
+                            if data_str == "[DONE]":
+                                break
+                            
+                            try:
+                                data = json.loads(data_str)
+                                if "choices" in data and len(data["choices"]) > 0:
+                                    delta = data["choices"][0].get("delta", {})
+                                    content = delta.get("content", "")
                                     
-                                    # Check if buffer contains newlines
-                                    while '\n' in buffer:
-                                        # Split at the first newline
-                                        parts = buffer.split('\n', 1)
-                                        line_part = parts[0]
-                                        # Print the part before the newline
-                                        console.print(line_part, style="green")
-                                        # Keep the remaining part in buffer
-                                        buffer = parts[1] if len(parts) > 1 else ""
-                        except json.JSONDecodeError:
-                            continue
+                                    if content:
+                                        full_response += content
+                                        # Update the Live display with the current markdown
+                                        live.update(Markdown(full_response))
+                            except json.JSONDecodeError:
+                                continue
                 
                 console.print("\n" + "─" * 60 + "\n", style="blue")
                 
