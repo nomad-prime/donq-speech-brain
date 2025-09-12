@@ -396,8 +396,14 @@ class TogetherClient:
                                     
                                     if content:
                                         full_response += content
-                                        # Update the Live display with the current markdown
-                                        live.update(Markdown(full_response))
+                                        # Update the Live display with the current markdown in a panel for better formatting
+                                        live.update(
+                                            Panel(
+                                                Markdown(full_response),
+                                                padding=(1, 2),
+                                                border_style="blue"
+                                            )
+                                        )
                             except json.JSONDecodeError:
                                 continue
                 
