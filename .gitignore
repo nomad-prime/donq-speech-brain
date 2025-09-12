@@ -14,3 +14,4 @@ wheels/
 .system_prompt.txt
 system_prompt.local.txt
 system_prompt.txt
+.aider*
