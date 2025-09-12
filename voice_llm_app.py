@@ -740,8 +740,14 @@ class VoiceLLMApp:
         else:
             self.run_space_toggle_mode()
     
+    def clear_terminal(self):
+        """Clear the terminal screen"""
+        # ANSI escape code to clear screen and move cursor to top-left
+        print("\033[2J\033[H", end="")
+    
     def run_vad_mode(self):
         """Run with Voice Activity Detection mode"""
+        self.clear_terminal()
         self.console.print("🎧 Listening... (speak now)", style="bold green")
         
         # Setup keyboard listener for 'R' reset functionality
@@ -799,6 +805,7 @@ class VoiceLLMApp:
     
     def run_space_toggle_mode(self):
         """Run with space bar toggle recording mode"""
+        self.clear_terminal()
         self.console.print(f"\n🎧 Ready! Press SPACE to start/stop recording...\n", style="bold green")
         
         # Setup keyboard listener
