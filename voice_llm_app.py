@@ -568,6 +568,7 @@ class VoiceLLMApp:
                 "• Pause for 2-3 seconds when done",
                 "• Wait for the LLM response",
                 "• Press 'R' to RESET conversation history",
+                "• Press 'T' to CLEAR terminal",
                 "• Press Ctrl+C to exit"
             ]
         else:
@@ -576,6 +577,7 @@ class VoiceLLMApp:
                 "• Press SPACE to START recording",
                 "• Press SPACE again to STOP and send to LLM",
                 "• Press 'R' to RESET conversation history",
+                "• Press 'T' to CLEAR terminal (when not recording)",
                 "• Wait for the LLM response",
                 "• Press 'Q' or Ctrl+C to exit"
             ]
@@ -767,6 +769,10 @@ class VoiceLLMApp:
                     count = self.together_client.get_conversation_count()
                     self.console.print(f"\n🔄 Conversation history reset! (was {count} messages)\n", style="cyan")
                     self.console.print("🎧 Listening... (speak now)", style="bold green")
+                elif key == 't' or key == 'T':
+                    # Clear terminal
+                    self.clear_terminal()
+                    self.console.print("🎧 Listening... (speak now)", style="bold green")
                 
                 # Read audio chunk
                 chunk = self.audio_capture.read_chunk()
@@ -834,6 +840,10 @@ class VoiceLLMApp:
                         self.together_client.reset_conversation()
                         self.console.print(f"\n🔄 Conversation history reset! (was {count} messages)\n", style="cyan")
                         self.console.print(f"🎧 Ready! Press SPACE to start recording... (Press 'Q' to quit)\n", style="bold green")
+                elif key == 't' or key == 'T':  # Clear terminal
+                    if not is_recording:  # Only allow clear when not recording
+                        self.clear_terminal()
+                        self.console.print(f"\n🎧 Ready! Press SPACE to start recording... (Press 'Q' to quit)\n", style="bold green")
                 elif key == ' ':  # Space bar to toggle recording
                     # Toggle recording state
                     if not is_recording:
