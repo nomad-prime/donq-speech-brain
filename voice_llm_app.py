@@ -570,6 +570,7 @@ class VoiceLLMApp:
                 "• Wait for the LLM response",
                 "• Press 'R' to RESET conversation history",
                 "• Press 'T' to CLEAR terminal",
+                "• Press 'C' to CONTINUE the last response",
                 "• Press Ctrl+C to exit"
             ]
         else:
@@ -579,6 +580,7 @@ class VoiceLLMApp:
                 "• Press SPACE again to STOP and send to LLM",
                 "• Press 'R' to RESET conversation history",
                 "• Press 'T' to CLEAR terminal (when not recording)",
+                "• Press 'C' to CONTINUE the last response (when not recording)",
                 "• Wait for the LLM response",
                 "• Press 'Q' or Ctrl+C to exit"
             ]
@@ -774,6 +776,36 @@ class VoiceLLMApp:
                     # Clear terminal
                     self.clear_terminal()
                     self.console.print("🎧 Listening... (speak now)", style="bold green")
+                elif key == 'c' or key == 'C':
+                    # Continue the last response by sending "continue" to the LLM
+                    if self.together_client.conversation_history:
+                        self.console.print("\n⏩ Continuing...", style="bold yellow")
+                        response = self.together_client.send_message("continue", stream=self.stream_response)
+                        
+                        if response:
+                            if not self.stream_response:
+                                # Standard mode: Display complete response in a panel
+                                markdown_response = Markdown(response)
+                                conv_count = self.together_client.get_conversation_count()
+                                title = f"🤖 LLM Response (Message {conv_count}) - Continued"
+                                
+                                self.console.print("\n")
+                                self.console.print(
+                                    Panel(
+                                        markdown_response,
+                                        title=title,
+                                        title_align="left",
+                                        border_style="blue",
+                                        padding=(1, 2)
+                                    )
+                                )
+                                self.console.print("\n")
+                        else:
+                            self.console.print("⚠️ No continuation received from LLM", style="yellow")
+                        
+                        self.console.print("🎧 Listening... (speak now)", style="bold green")
+                    else:
+                        self.console.print("⚠️ No conversation history to continue from", style="yellow")
                 
                 # Read audio chunk
                 chunk = self.audio_capture.read_chunk()
@@ -845,6 +877,36 @@ class VoiceLLMApp:
                     if not is_recording:  # Only allow clear when not recording
                         self.clear_terminal()
                         self.console.print(f"\n🎧 Ready! Press SPACE to start recording... (Press 'Q' to quit)\n", style="bold green")
+                elif key == 'c' or key == 'C':  # Continue the last response
+                    if not is_recording:  # Only allow continue when not recording
+                        if self.together_client.conversation_history:
+                            self.console.print("\n⏩ Continuing...", style="bold yellow")
+                            response = self.together_client.send_message("continue", stream=self.stream_response)
+                            
+                            if response:
+                                if not self.stream_response:
+                                    # Standard mode: Display complete response in a panel
+                                    markdown_response = Markdown(response)
+                                    conv_count = self.together_client.get_conversation_count()
+                                    title = f"🤖 LLM Response (Message {conv_count}) - Continued"
+                                    
+                                    self.console.print("\n")
+                                    self.console.print(
+                                        Panel(
+                                            markdown_response,
+                                            title=title,
+                                            title_align="left",
+                                            border_style="blue",
+                                            padding=(1, 2)
+                                        )
+                                    )
+                                    self.console.print("\n")
+                            else:
+                                self.console.print("⚠️ No continuation received from LLM", style="yellow")
+                            
+                            self.console.print(f"\n🎧 Ready! Press SPACE to start recording... (Press 'Q' to quit)\n", style="bold green")
+                        else:
+                            self.console.print("⚠️ No conversation history to continue from", style="yellow")
                 elif key == ' ':  # Space bar to toggle recording
                     # Toggle recording state
                     if not is_recording:
